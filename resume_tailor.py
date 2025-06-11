@@ -1,19 +1,32 @@
-from fastapi import FastAPI, UploadFile, File, Form
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi import HTTPException
-from openai import OpenAI, OpenAIError
+import os
 import shutil
+from openai import OpenAI, OpenAIError
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pdf2docx import Converter
 from docx import Document
 from docx2pdf import convert
+from dotenv import load_dotenv
 import logging
 
-from dotenv import load_dotenv
-import os
+# Load environment variables
+load_dotenv()
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+if not GITHUB_TOKEN:
+    raise RuntimeError("Missing GITHUB_TOKEN in environment")
 
+# Initialize GitHub AI client
+client = OpenAI(
+    base_url="https://models.github.ai/inference",
+    api_key=GITHUB_TOKEN,
+)
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("uvicorn.error")
+
+# FastAPI app
 app = FastAPI()
-
-# CORS middleware for frontend integration
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -22,120 +35,96 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Directory for uploads
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-load_dotenv()
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-if not GITHUB_TOKEN:
-    raise RuntimeError("Missing GITHUB_TOKEN in environment")
-
-# Initialize the GitHub AI client
-client = OpenAI(
-    base_url="https://models.github.ai/inference",
-    api_key=GITHUB_TOKEN,
-)
-
-logger = logging.getLogger("uvicorn.error")
-
-def tailor_section(job_description: str, original_text: str) -> str:
-    # Build the chat messages
+def tailor_bullet(section_name: str, job_description: str, original_text: str) -> str:
+    """Call GitHub GPT-4o to rewrite a single bullet point or skill."""
+    prompt = f"Rewrite this {section_name} bullet point or skill to match the job description, returning a single bullet point. Job Description: {job_description}\nOriginal Text: {original_text}"
     messages = [
         {"role": "system", "content": "You are an expert resume writer."},
-        {"role": "user", "content": (
-            f"Rewrite this resume section to match the job description:\n\n"
-            f"Job Description:\n{job_description}\n\n"
-            f"Original Section:\n{original_text}\n\n"
-            "Tailored Section:"
-        )}
+        {"role": "user", "content": prompt}
     ]
-
     try:
         response = client.chat.completions.create(
-            model="openai/gpt-4o",
+            model="openai/gpt-4.1-mini",
             messages=messages,
             temperature=0.7,
-            max_tokens=500,
+            max_tokens=150,
             top_p=1.0
         )
         return response.choices[0].message.content.strip()
-
-
     except OpenAIError as e:
         logger.error(f"GitHub AI error: {e}", exc_info=True)
-        raise HTTPException(
-            status_code=502,
-            detail=f"GitHub AI API error: {e}"
-        )
+        raise HTTPException(status_code=502, detail=f"GitHub AI API error: {e}")
 
-def process_resume(resume_path: str, job_description: str) -> tuple:
-    # Convert PDF to DOCX
-    docx_path = resume_path.replace(".pdf", ".docx")
-    cv = Converter(resume_path)
-    cv.convert(docx_path)
-    cv.close()
+def is_bullet_point(paragraph) -> bool:
+    """Check if a paragraph is a bullet point based on style or text prefix."""
+    text = paragraph.text.strip()
+    return paragraph.style.name.startswith("List") or text.startswith(("-", "•", "*"))
 
-    # Load DOCX
+def process_docx(docx_path: str, job_description: str):
+    """Process the DOCX file by tailoring each bullet point or skill individually."""
     doc = Document(docx_path)
-
-    # Identify sections (simplified heuristic)
-    sections = {"Summary": [], "Skills": [], "Experience": []}
     current_section = None
+
     for para in doc.paragraphs:
         text = para.text.strip().lower()
-        if "summary" in text and not current_section:
-            current_section = "Summary"
-        elif "skills" in text and not current_section:
-            current_section = "Skills"
-        elif "experience" in text and not current_section:
-            current_section = "Experience"
-        elif current_section and text and para.text not in sections:
-            sections[current_section].append(para)
+        # Identify section headers
+        if text in ["objective", "skills", "experience"]:
+            current_section = text.capitalize()
+            continue
+        # Process bullet points or skills under the current section
+        if current_section and (is_bullet_point(para) or current_section == "Skills") and para.text.strip():
+            original_text = para.text.strip()
+            tailored_text = tailor_bullet(current_section, job_description, original_text)
+            # Replace text in-place, preserving style
+            para.clear()
+            para.add_run(tailored_text)
 
-    # Tailor each section
-    for section, paragraphs in sections.items():
-        if paragraphs:
-            original_text = "\n".join([p.text for p in paragraphs if p.text.strip()])
-            if original_text:
-                tailored_text = tailor_section(job_description, original_text)
-                for para in paragraphs:
-                    para.text = ""  # Clear original
-                paragraphs[0].text = tailored_text  # Replace with tailored
+    tailored_docx_path = docx_path.replace(".docx", "_tailored.docx")
+    doc.save(tailored_docx_path)
+    return tailored_docx_path
 
-    # Save tailored DOCX
-    tailored_docx = os.path.join(UPLOAD_DIR, f"tailored_{os.path.basename(resume_path).replace('.pdf', '.docx')}")
-    doc.save(tailored_docx)
+def process_resume(resume_pdf: str, job_description: str) -> tuple[str, str]:
+    """Process the resume by converting to DOCX, tailoring bullet points, and converting back to PDF."""
+    try:
+        # Convert PDF to DOCX
+        temp_docx = resume_pdf.replace(".pdf", ".docx")
+        cv = Converter(resume_pdf)
+        cv.convert(temp_docx)
+        cv.close()
 
-    # Convert to PDF
-    tailored_pdf = tailored_docx.replace(".docx", ".pdf")
-    convert(tailored_docx, tailored_pdf)
+        # Process the DOCX by tailoring bullet points and skills
+        tailored_docx = process_docx(temp_docx, job_description)
 
-    # Clean up temporary files
-    os.remove(resume_path)
-    os.remove(docx_path)
+        # Convert tailored DOCX to PDF
+        tailored_pdf = tailored_docx.replace(".docx", ".pdf")
+        convert(tailored_docx, tailored_pdf)
 
-    return tailored_pdf, tailored_docx
+        # Clean up temporary files
+        os.remove(resume_pdf)
+        os.remove(temp_docx)
 
+        return tailored_pdf, tailored_docx
+    except Exception as e:
+        logger.error(f"Error processing resume: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Error processing resume")
 
 @app.post("/tailor-resume")
-async def tailor_resume(resume: UploadFile = File(...), job_description: str = Form(...)):
-    # Save uploaded resume
-    resume_path = os.path.join(UPLOAD_DIR, resume.filename)
-    with open(resume_path, "wb") as f:
+async def tailor_resume(
+    resume: UploadFile = File(...),
+    job_description: str = Form(...)
+):
+    """Endpoint to upload a resume PDF and job description, returning tailored files."""
+    pdf_path = os.path.join(UPLOAD_DIR, resume.filename)
+    with open(pdf_path, "wb") as f:
         shutil.copyfileobj(resume.file, f)
 
-    # Process the resume
-    tailored_pdf, tailored_docx = process_resume(resume_path, job_description)
+    tailored_pdf, tailored_docx = process_resume(pdf_path, job_description)
+    return {"pdf_path": tailored_pdf, "docx_path": tailored_docx}
 
-    # Return file paths (in production, use unique IDs and serve files)
-    return {
-        "message": "Resume tailored successfully",
-        "pdf_path": tailored_pdf,
-        "docx_path": tailored_docx
-    }
-
-
-if __name__ == "__main__":
-    import uvicorn
-
-    uvicorn.run(app, host="0.0.0.0", port=8001)
+@app.get("/")
+async def health_check():
+    return {"status": "OK"}
