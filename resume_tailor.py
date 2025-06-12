@@ -8,9 +8,7 @@ from openai import OpenAI, OpenAIError
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pdf2docx import Converter
 from docx import Document
-from docx.shared import Pt
 from docx2pdf import convert
 from dotenv import load_dotenv
 
@@ -22,7 +20,7 @@ GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 if not GITHUB_TOKEN:
     raise RuntimeError("FATAL: Missing GITHUB_TOKEN in environment variables.")
 
-# Initialize the AI client for GitHub Models
+# Initialize the AI client
 try:
     client = OpenAI(
         base_url="https://models.github.ai/inference",
@@ -31,14 +29,13 @@ try:
 except Exception as e:
     raise RuntimeError(f"Failed to initialize OpenAI client: {e}")
 
-# Set up logging to monitor application activity and errors
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger("uvicorn.error")
+# Set up logging to provide detailed insight into the process
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 # Initialize FastAPI app
-app = FastAPI(title="Resume Tailoring API v3")
+app = FastAPI(title="Resume Tailoring API v7 (Block-Aware)")
 
-# Add CORS middleware for frontend integration
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -47,35 +44,46 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Directory for storing uploaded and generated files
+# Directory for storing files
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 # --- CORE AI AND DOCUMENT PROCESSING LOGIC ---
 
-# Use a semaphore to limit concurrent API requests to prevent rate-limiting.
-# A value of 3-5 is a safe starting point.
 API_CONCURRENCY_LIMIT = 4
 semaphore = asyncio.Semaphore(API_CONCURRENCY_LIMIT)
 
 
-async def tailor_bullet(section_name: str, job_description: str, original_text: str) -> str:
+async def tailor_content(section_name: str, job_description: str, original_text: str) -> str:
     """
-    Asynchronously calls the AI model, respecting the semaphore to limit concurrency.
+    Asynchronously calls the AI model with a prompt tailored to the content type (bullet or paragraph).
     """
     async with semaphore:
-        logger.info(f"Semaphore acquired. Tailoring bullet for section: {section_name}")
+        # Default prompt for standard bullet points
+        prompt_instruction = (
+            "Rewrite this single resume bullet point to be more impactful and align with the job description. "
+            "**Crucially, the rewritten bullet point's word count MUST be within 10% (plus or minus) of the original's word count.** "
+            "This is essential to preserve the document layout. "
+            "Return only the single, rewritten bullet point text, without any prefixes like '•' or '-'."
+        )
+
+        # Specific prompt for paragraph-based sections like Objective or Summary
+        if any(sec in section_name.upper() for sec in ["OBJECTIVE", "SUMMARY", "ABOUT"]):
+            prompt_instruction = (
+                "Rewrite this resume summary/objective paragraph to be more impactful and align with the job description. "
+                "**The rewritten paragraph's word count MUST be almost identical to the original to preserve the document's layout.** "
+                "Return only the rewritten paragraph text."
+            )
+
         prompt = (
-            f"Rewrite this single resume bullet point from the '{section_name}' section to be more impactful and align "
-            f"closely with the following job description. **Crucially, you must keep the word count of your rewritten "
-            f"bullet point as close as possible to the original to preserve the document's layout.** "
-            f"Return only the single, rewritten bullet point text, without any prefixes like '•' or '-'.\n\n"
+            f"{prompt_instruction}\n\n"
+            f"Resume Section: '{section_name}'\n"
             f"Job Description: \"{job_description}\"\n\n"
-            f"Original Bullet Point: \"{original_text}\""
+            f"Original Text:\n---\n{original_text}\n---"
         )
         messages = [
             {"role": "system",
-             "content": "You are an expert resume writer. Your task is to refine resume content to be concise and perfectly tailored to a job description, while strictly maintaining the original's approximate word count to preserve document formatting."},
+             "content": "You are a world-class resume writing expert. Your task is to refine resume content to be concise and perfectly tailored to a job description, while strictly respecting constraints on word count and layout to preserve the document's one-page format."},
             {"role": "user", "content": prompt}
         ]
         try:
@@ -86,91 +94,30 @@ async def tailor_bullet(section_name: str, job_description: str, original_text: 
                     model="openai/gpt-4o-mini",
                     messages=messages,
                     temperature=0.6,
-                    max_tokens=200,
+                    max_tokens=400,
                     top_p=1.0
                 )
             )
             rewritten_text = response.choices[0].message.content.strip()
-            return re.sub(r'^[•*-]\s*', '', rewritten_text)
+            # Clean up potential markdown code blocks from the response
+            return re.sub(r'```.*?\n|```', '', rewritten_text, flags=re.DOTALL)
 
         except OpenAIError as e:
-            if isinstance(e, OpenAIError) and "Too Many Requests" in str(e):
-                logger.warning(
-                    "Rate limit hit, will be retried by the client library. Consider lowering API_CONCURRENCY_LIMIT if this persists.")
             logger.error(f"GitHub AI API error: {e}", exc_info=True)
             raise HTTPException(status_code=502, detail=f"An error occurred with the AI service: {e}")
         except Exception as e:
-            logger.error(f"Unexpected error in tailor_bullet: {e}", exc_info=True)
+            logger.error(f"Unexpected error in tailor_content: {e}", exc_info=True)
             return original_text  # Fallback to original text
-
-
-def get_paragraph_formatting(para):
-    """Captures all formatting from a paragraph's first run."""
-    if not para.runs:
-        return {}
-
-    first_run = para.runs[0]
-    font = first_run.font
-    return {
-        'style': para.style.name,
-        'font_name': font.name,
-        'font_size': font.size,
-        'bold': font.bold,
-        'italic': font.italic,
-        'underline': font.underline,
-        'color': font.color.rgb if font.color and font.color.rgb else None,
-        'paragraph_format': {
-            'alignment': para.alignment,
-            'left_indent': para.paragraph_format.left_indent,
-            'right_indent': para.paragraph_format.right_indent,
-            'first_line_indent': para.paragraph_format.first_line_indent,
-            'space_before': para.paragraph_format.space_before,
-            'space_after': para.paragraph_format.space_after,
-            'line_spacing': para.paragraph_format.line_spacing,
-        }
-    }
-
-
-def apply_paragraph_formatting(para, new_text, formatting):
-    """Applies captured formatting to a new run in a cleared paragraph."""
-    # Clear existing content by removing all runs
-    for run in list(para.runs):
-        p = para._p
-        p.remove(run._r)
-
-    # Add the new text in a single run
-    run = para.add_run(new_text)
-
-    # Apply font formatting
-    font = run.font
-    font.name = formatting.get('font_name')
-    font.size = formatting.get('font_size')
-    font.bold = formatting.get('bold')
-    font.italic = formatting.get('italic')
-    font.underline = formatting.get('underline')
-    if formatting.get('color'):
-        font.color.rgb = formatting['color']
-
-    # Apply paragraph formatting
-    p_fmt = para.paragraph_format
-    fmt_p_info = formatting.get('paragraph_format', {})
-    if fmt_p_info.get('alignment') is not None:
-        p_fmt.alignment = fmt_p_info['alignment']
-    p_fmt.left_indent = fmt_p_info.get('left_indent')
-    p_fmt.right_indent = fmt_p_info.get('right_indent')
-    p_fmt.first_line_indent = fmt_p_info.get('first_line_indent')
-    p_fmt.space_before = fmt_p_info.get('space_before')
-    p_fmt.space_after = fmt_p_info.get('space_after')
-    p_fmt.line_spacing = fmt_p_info.get('line_spacing')
 
 
 def is_section_header(paragraph) -> bool:
     """Flexibly checks if a paragraph is a section header."""
     text = paragraph.text.strip()
-    if not text:
+    if not text or len(text) > 50:
         return False
+    # Added "ABOUT" to the list of recognized headers
     header_pattern = re.compile(
-        r'^(PROFESSIONAL EXPERIENCE|WORK HISTORY|EXPERIENCE|EDUCATION|SKILLS|OBJECTIVE|SUMMARY|TECHNICAL SKILLS):?$',
+        r'^(PROFESSIONAL EXPERIENCE|WORK HISTORY|EXPERIENCE|EDUCATION|SKILLS|OBJECTIVE|SUMMARY|ABOUT|TECHNICAL SKILLS|PROJECTS|ACHIEVEMENTS):?$',
         re.IGNORECASE)
     is_bold = any(run.bold for run in paragraph.runs)
     is_all_caps = text.isupper() and len(text.split()) < 5
@@ -179,129 +126,175 @@ def is_section_header(paragraph) -> bool:
 
 def is_bullet_point(paragraph) -> bool:
     """Checks if a paragraph is a bullet point."""
-    style_is_list = paragraph.style.name.lower().startswith('list')
+    style_is_list = paragraph.style and paragraph.style.name.lower().startswith('list')
     text_is_bullet = paragraph.text.strip().startswith(("-", "•", "*"))
     return style_is_list or text_is_bullet
 
 
-async def process_docx(docx_path: str, job_description: str) -> str:
+def replace_paragraph_text(paragraph, new_text):
     """
-    Processes the DOCX file, preserving formatting and concurrently tailoring bullets.
+    Surgically replaces the text of a paragraph while preserving all formatting of its runs.
+    """
+    prefix = ""
+    # Retain original bullet character if present
+    if paragraph.text.strip().startswith('•'):
+        prefix = '• '
+    elif paragraph.text.strip().startswith('*'):
+        prefix = '* '
+    elif paragraph.text.strip().startswith('-'):
+        prefix = '- '
+
+    runs = paragraph.runs
+    if not runs: return
+
+    runs[0].text = prefix + new_text
+    for i in range(1, len(runs)):
+        runs[i].text = ''
+
+
+async def process_docx_natively(docx_path: str, job_description: str) -> str:
+    """
+    Processes the DOCX using block-based logic for different section types.
     """
     doc = Document(docx_path)
-    current_section = "Unknown"
-    tasks = []
-    paragraphs_to_process = []
 
+    LOCKED_SECTIONS = ["EDUCATION", "ACHIEVEMENTS"]
+    BLOCK_SECTIONS = ["OBJECTIVE", "SUMMARY", "ABOUT"]
+
+    tasks = []
+    task_metadata = []  # To map results back to the document structure
+
+    # 1. Group document content into blocks by section header
+    content_blocks = []
+    current_block = None
     for para in doc.paragraphs:
         if is_section_header(para):
-            current_section = para.text.strip().capitalize()
+            if current_block:
+                content_blocks.append(current_block)
+            section_name = para.text.strip().upper().replace(':', '')
+            current_block = {'section': section_name, 'paragraphs': []}
+        elif current_block:
+            current_block['paragraphs'].append(para)
+    if current_block:  # Add the last block to the list
+        content_blocks.append(current_block)
+
+    # 2. Create AI tasks based on the content of each block
+    for block in content_blocks:
+        section = block['section']
+        if any(locked in section for locked in LOCKED_SECTIONS):
             continue
 
-        text = para.text.strip()
-        if text and (is_bullet_point(para) or "Skills" in current_section):
-            # Strip the bullet character itself for a cleaner prompt
-            original_text_for_ai = re.sub(r'^[•*-]\s*', '', text)
-            formatting = get_paragraph_formatting(para)
-            paragraphs_to_process.append({'para': para, 'text': original_text_for_ai, 'format': formatting,
-                                          'prefix': text.split(' ')[0] + ' ' if text.startswith(
-                                              ("-", "•", "*")) else ''})
+        if any(block_sec in section for block_sec in BLOCK_SECTIONS):
+            # Process Objective, Summary, etc. as a single block
+            original_text = "\n".join([p.text for p in block['paragraphs']]).strip()
+            if original_text:
+                task = tailor_content(section, job_description, original_text)
+                tasks.append(task)
+                task_metadata.append({'type': 'block', 'block': block})
+        else:
+            # Process other sections (Experience, Projects) as individual bullet points
+            for para in block['paragraphs']:
+                text = para.text.strip()
+                if text and is_bullet_point(para):
+                    text_for_ai = re.sub(r'^[•*-]\s*', '', text)
+                    task = tailor_content(section, job_description, text_for_ai)
+                    tasks.append(task)
+                    task_metadata.append({'type': 'bullet', 'para': para})
 
-    for item in paragraphs_to_process:
-        # Create the task, which will wait for the semaphore before running
-        task = tailor_bullet(current_section, job_description, item['text'])
-        tasks.append(task)
+    if not tasks:
+        logger.warning("No editable content was found. The document will not be changed.")
+        return docx_path
 
-    if tasks:
-        logger.info(f"Processing {len(tasks)} bullets with a concurrency limit of {API_CONCURRENCY_LIMIT}...")
-        tailored_results = await asyncio.gather(*tasks, return_exceptions=True)
-        logger.info("AI tailoring complete. Applying changes to document.")
+    # 3. Execute all tasks concurrently
+    logger.info(f"Found {len(tasks)} items to process. Sending to AI...")
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    logger.info("AI processing complete. Applying changes to the document...")
 
-        # Check for exceptions returned by asyncio.gather
-        for i, result in enumerate(tailored_results):
-            if isinstance(result, Exception):
-                logger.error(
-                    f"Task for bullet {i + 1} failed with exception: {result}. The original text will be kept.")
-                # We can get the original text from our list to ensure the document is still generated
-                tailored_results[i] = paragraphs_to_process[i]['text']
+    # 4. Apply changes back to the document
+    changes_applied = 0
+    for i, res in enumerate(results):
+        meta = task_metadata[i]
+        if isinstance(res, Exception):
+            logger.error(f"Task for section '{meta.get('block', {}).get('section', '')}' failed: {res}. Original kept.")
+            continue
 
-        for i, item in enumerate(paragraphs_to_process):
-            full_new_text = f"{item['prefix']}{tailored_results[i]}"
-            apply_paragraph_formatting(item['para'], full_new_text, item['format'])
+        if meta['type'] == 'block':
+            # Replace a whole block of text (for Skills/Objective)
+            original_text = "\n".join([p.text for p in meta['block']['paragraphs']]).strip()
+            if res.strip().lower() != original_text.lower():
+                logger.info(f"Applying BLOCK change for section '{meta['block']['section']}'")
+                new_lines = res.strip().split('\n')
+                block_paras = meta['block']['paragraphs']
+                for j, para in enumerate(block_paras):
+                    if j < len(new_lines):
+                        replace_paragraph_text(para, new_lines[j])
+                    else:  # Clear out extra paragraphs if the new text is shorter
+                        para.clear()
+                changes_applied += 1
+
+        elif meta['type'] == 'bullet':
+            # Replace a single bullet point
+            para = meta['para']
+            original_text = re.sub(r'^[•*-]\s*', '', para.text.strip())
+            if res.strip().lower() != original_text.lower():
+                logger.info(f"Applying change for bullet: {res[:50]}...")
+                replace_paragraph_text(para, res)
+                changes_applied += 1
+
+    logger.info(f"Processing finished. Total changes applied: {changes_applied}/{len(tasks)}.")
 
     tailored_docx_path = docx_path.replace(".docx", "_tailored.docx")
     doc.save(tailored_docx_path)
     return tailored_docx_path
 
 
-async def process_resume(resume_path: str, job_description: str) -> tuple[str, str]:
-    """Main processing pipeline: PDF -> DOCX -> Tailor -> PDF."""
-    try:
-        temp_docx_path = resume_path.replace(".pdf", ".docx")
-        logger.info(f"Converting {resume_path} to DOCX...")
-        cv = Converter(resume_path)
-        cv.convert(temp_docx_path, start=0, end=None)
-        cv.close()
-        logger.info("Conversion to DOCX successful.")
-
-        logger.info("Processing DOCX with AI (formatting-aware, rate-limited)...")
-        tailored_docx_path = await process_docx(temp_docx_path, job_description)
-        logger.info("DOCX processing complete.")
-
-        tailored_pdf_path = tailored_docx_path.replace(".docx", ".pdf")
-        logger.info(f"Converting {tailored_docx_path} back to PDF...")
-        convert(tailored_docx_path, tailored_pdf_path)
-        logger.info("Conversion to PDF successful.")
-
-        os.remove(resume_path)
-        os.remove(temp_docx_path)
-
-        return tailored_pdf_path, tailored_docx_path
-    except Exception as e:
-        logger.error(f"Error in process_resume pipeline: {e}", exc_info=True)
-        # Clean up failed intermediate files
-        if 'temp_docx_path' in locals() and os.path.exists(temp_docx_path):
-            os.remove(temp_docx_path)
-        raise HTTPException(status_code=500, detail=f"An internal error occurred during resume processing: {e}")
-
-
-# --- API ENDPOINTS ---
+# --- API ENDPOINTS (No changes below this line) ---
 
 @app.post("/tailor-resume")
-async def tailor_resume_endpoint(
-        job_description: str = Form(...),
-        resume: UploadFile = File(...)
-):
-    """Endpoint to upload a resume PDF and job description."""
+async def tailor_resume_endpoint(job_description: str = Form(...), resume: UploadFile = File(...)):
+    if not resume.filename.lower().endswith('.docx'):
+        raise HTTPException(status_code=400, detail="Invalid file type. Please upload a .docx file.")
+
     secure_suffix = str(uuid.uuid4())
     original_filename = os.path.splitext(resume.filename)[0].replace(" ", "_")
-    pdf_path = os.path.join(UPLOAD_DIR, f"{original_filename}_{secure_suffix}.pdf")
+    docx_path = os.path.join(UPLOAD_DIR, f"{original_filename}_{secure_suffix}.docx")
 
-    logger.info(f"Receiving file '{resume.filename}'. Saving as '{pdf_path}'.")
+    logger.info(f"Receiving DOCX file '{resume.filename}'. Saving as '{docx_path}'.")
     try:
-        with open(pdf_path, "wb") as f:
+        with open(docx_path, "wb") as f:
             shutil.copyfileobj(resume.file, f)
 
-        tailored_pdf_path, tailored_docx_path = await process_resume(pdf_path, job_description)
+        tailored_docx_path = await process_docx_natively(docx_path, job_description)
+
+        tailored_pdf_path = tailored_docx_path.replace(".docx", ".pdf")
+        if tailored_docx_path != docx_path:
+            logger.info(f"Converting {os.path.basename(tailored_docx_path)} to PDF...")
+            convert(tailored_docx_path, tailored_pdf_path)
+            logger.info("Conversion to PDF successful.")
+        else:
+            logger.info("No changes were made, converting original document to PDF.")
+            convert(docx_path, tailored_pdf_path.replace("_tailored", ""))
+            tailored_pdf_path = tailored_pdf_path.replace("_tailored", "")
+
+        if os.path.exists(docx_path):
+            os.remove(docx_path)
 
         return {
-            "message": "Resume tailored successfully while preserving format!",
+            "message": "Resume processing complete!",
             "pdf_download_url": f"/download/{os.path.basename(tailored_pdf_path)}",
             "docx_download_url": f"/download/{os.path.basename(tailored_docx_path)}",
         }
-    except HTTPException:
-        raise
     except Exception as e:
-        logger.error(f"Error in tailor_resume_endpoint: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Failed to process the resume.")
+        logger.error(f"An unexpected error occurred in tailor_resume_endpoint: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to process the resume. Error: {e}")
 
 
 @app.get("/download/{filename}")
 async def download_file(filename: str, background_tasks: BackgroundTasks):
-    """Serves a generated file for download and cleans it up afterward."""
     file_path = os.path.join(UPLOAD_DIR, filename)
     if not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail="File not found.")
+        raise HTTPException(status_code=404,
+                            detail=f"File not found: {filename}. It may have been deleted or never created.")
 
     background_tasks.add_task(os.remove, file_path)
 
@@ -311,5 +304,5 @@ async def download_file(filename: str, background_tasks: BackgroundTasks):
 @app.get("/", summary="Health Check")
 async def health_check():
     """Health check endpoint."""
-    return {"status": "OK", "message": "Resume Tailoring API v3 is running."}
+    return {"status": "OK", "message": "Resume Tailoring API v7 (Block-Aware) is running."}
 
